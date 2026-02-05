@@ -188,11 +188,6 @@ typedef struct {
  * API Functions
  * ======================================================================== */
 
-/* Streaming output destination for convenience functions (vox_transcribe_stdin).
- * When non-NULL, tokens are written here as they are generated.
- * Set to stdout for CLI streaming output. */
-extern FILE *vox_stream_output;
-
 /* Load model from directory containing consolidated.safetensors + tekken.json */
 vox_ctx_t *vox_load(const char *model_dir);
 

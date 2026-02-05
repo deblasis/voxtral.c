@@ -158,7 +158,7 @@ printf("\n");
 vox_stream_free(s);
 ```
 
-`feed()` runs the mel spectrogram, encoder, and decoder on available data, queuing output tokens. `finish()` adds padding and processes remaining audio. `get()` retrieves pending tokens — call it after each `feed()` or whenever convenient. If `vox_stream_output` is set, tokens are also printed there as they are generated. Token string pointers returned by `vox_stream_get()` are valid until `vox_stream_free()`.
+`feed()` runs the mel spectrogram, encoder, and decoder on available data, queuing output tokens. `finish()` adds padding and processes remaining audio. `get()` retrieves pending tokens — call it after each `feed()` or whenever convenient. Token string pointers returned by `vox_stream_get()` are valid until `vox_stream_free()`.
 
 Use `vox_set_processing_interval(s, seconds)` to batch encoder/decoder work. When set, `feed()` accumulates audio but only runs the encoder/decoder after at least the specified duration of new audio has been fed (0 = process on every `feed()`, the default). This can improve efficiency when feeding audio in many small chunks.
 

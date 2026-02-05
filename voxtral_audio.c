@@ -47,7 +47,7 @@ static uint32_t read_u32(const uint8_t *p) { return p[0] | (p[1] << 8) | (p[2] <
 
 /* Parse WAV data from a buffer. Returns mono float32 samples at 16kHz.
  * The caller keeps ownership of data. Returns NULL on error. */
-static float *parse_wav_buffer(const uint8_t *data, size_t file_size, int *out_n_samples) {
+float *vox_parse_wav_buffer(const uint8_t *data, size_t file_size, int *out_n_samples) {
     if (file_size < 44 || memcmp(data, "RIFF", 4) != 0 || memcmp(data + 8, "WAVE", 4) != 0) {
         fprintf(stderr, "parse_wav_buffer: not a valid WAV file\n");
         return NULL;
@@ -158,7 +158,7 @@ float *vox_load_wav(const char *path, int *out_n_samples) {
     }
     fclose(f);
 
-    float *samples = parse_wav_buffer(data, (size_t)file_size, out_n_samples);
+    float *samples = vox_parse_wav_buffer(data, (size_t)file_size, out_n_samples);
     free(data);
     return samples;
 }
@@ -193,7 +193,7 @@ float *vox_read_pcm_stdin(int *out_n_samples) {
     /* Auto-detect: WAV (RIFF header) or raw s16le */
     if (memcmp(buf, "RIFF", 4) == 0) {
         fprintf(stderr, "Detected WAV format on stdin\n");
-        float *samples = parse_wav_buffer(buf, size, out_n_samples);
+        float *samples = vox_parse_wav_buffer(buf, size, out_n_samples);
         free(buf);
         return samples;
     }

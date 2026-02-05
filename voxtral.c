@@ -23,9 +23,6 @@
 /* Global verbose flag */
 int vox_verbose = 0;
 
-/* Streaming output: when non-NULL, tokens are decoded and written here ASAP */
-FILE *vox_stream_output = NULL;
-
 /* ========================================================================
  * Decoder timing conditioning (t_cond + per-layer ada_scale)
  * ======================================================================== */
@@ -401,10 +398,6 @@ static void stream_enqueue_token(vox_stream_t *s, const char *piece) {
     }
     s->token_queue[s->queue_tail] = piece;
     s->queue_tail = next_tail;
-    if (vox_stream_output) {
-        fputs(piece, vox_stream_output);
-        fflush(vox_stream_output);
-    }
 }
 
 /* Run encoder chunks on available mel, append adapter tokens */
@@ -665,11 +658,6 @@ int vox_stream_finish(vox_stream_t *s) {
     stream_run_decoder(s);
 
     if (vox_verbose >= 1) {
-        /* Ensure stdout transcription output ends with newline before timing */
-        if (vox_stream_output) {
-            fputs("\n", vox_stream_output);
-            fflush(vox_stream_output);
-        }
         fprintf(stderr, "Encoder: %d mel -> %d tokens (%.0f ms)\n",
                 s->mel_cursor, s->total_adapter, s->encoder_ms);
         if (s->n_generated > 0)
