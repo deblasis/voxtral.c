@@ -14,7 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define FEED_CHUNK 16000 /* 1 second of audio at 16kHz */
+#define DEFAULT_FEED_CHUNK 16000 /* 1 second at 16kHz */
 
 static void usage(const char *prog) {
     fprintf(stderr, "voxtral.c — Voxtral Realtime 4B speech-to-text\n\n");
@@ -48,12 +48,14 @@ static void drain_tokens(vox_stream_t *s) {
     }
 }
 
-/* Feed audio in chunks, printing tokens as they become available */
+/* Feed audio in chunks, printing tokens as they become available.
+ * feed_chunk controls granularity: smaller = more responsive token output. */
+static int feed_chunk = DEFAULT_FEED_CHUNK;
 static void feed_and_drain(vox_stream_t *s, const float *samples, int n_samples) {
     int off = 0;
     while (off < n_samples) {
         int chunk = n_samples - off;
-        if (chunk > FEED_CHUNK) chunk = FEED_CHUNK;
+        if (chunk > feed_chunk) chunk = feed_chunk;
         vox_stream_feed(s, samples + off, chunk);
         off += chunk;
         drain_tokens(s);
@@ -123,7 +125,12 @@ int main(int argc, char **argv) {
         vox_free(ctx);
         return 1;
     }
-    if (interval > 0) vox_set_processing_interval(s, interval);
+    if (interval > 0) {
+        vox_set_processing_interval(s, interval);
+        feed_chunk = (int)(interval * VOX_SAMPLE_RATE);
+        if (feed_chunk < 160) feed_chunk = 160;
+        if (feed_chunk > DEFAULT_FEED_CHUNK) feed_chunk = DEFAULT_FEED_CHUNK;
+    }
 
     if (use_stdin) {
         /* Peek at first 4 bytes to detect WAV vs raw */
