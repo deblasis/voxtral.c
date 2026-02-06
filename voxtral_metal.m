@@ -2829,8 +2829,10 @@ int vox_metal_encoder_full_step(void *ctx_ptr, float *x, int new_len,
 
                 [enc_cmd memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
-                /* Encoder attention: all heads in one dispatch */
-                int q_offset_val = ctx->enc_kv_pos_offset + cache_len;
+                /* Encoder attention: all heads in one dispatch.
+                 * q_offset = cache_len (physical, not logical — KV cache uses
+                 * physical indices, so window masking must too). */
+                int q_offset_val = cache_len;
                 size_t layer_kv_offset = (size_t)layer * ctx->enc_kv_cache_max * kv_dim * sizeof(float);
                 [enc_cmd setComputePipelineState:g_encoder_attention_pipeline];
                 [enc_cmd setBuffer:bufQ offset:0 atIndex:0];
