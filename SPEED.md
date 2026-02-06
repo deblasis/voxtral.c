@@ -84,11 +84,16 @@
 - **Result: encoder conv stem 2008ms → 12ms (167x faster!)**
 - **Encoder total: 2737 → 804 ms (test_speech), 5613 → 1295 ms (jfk)**
 
+### Attempt 7: Encoder wo projection on GPU (SUCCESS)
+- Moved encoder output projection (wo) from CPU bf16→f32+sgemm to GPU MPS matmul
+- Was the only remaining CPU matmul in the encoder pipeline
+- **Result: encoder 804 → 683 ms (test_speech), 1295 → 1254 ms (jfk)**
+
 ### Next targets
 - Decoder: ~23.7 ms/step, theoretical floor ~23 ms (0.7ms gap, near bandwidth limit)
-- Encoder: ~800ms for test_speech, dominated by GPU transformer layers
-  - GPU QKV/FFN: ~500ms, GPU attention: ~200ms, CPU wo: ~50ms
-  - Ideas: move wo projection to GPU, merged encoder QKV weights
+- Encoder: ~683ms for test_speech, dominated by GPU transformer layers
+  - Attention: 64 per-head MPS encodes per layer × 32 = 2048 encodes (high overhead)
+  - Ideas: fused/batched encoder attention, merged encoder QKV weights
 
 ## MLX Credits
 - If any optimization ideas or kernel code are taken from Apple MLX

@@ -251,7 +251,20 @@ float *vox_encoder_forward(vox_ctx_t *ctx, const float *mel,
 #endif
 
         /* Output projection + residual */
-        vox_linear_bf16(proj_out, attn_out, l->wo_weight_bf16, l->wo_bias, seq_len, qkv_dim, dim);
+#ifdef USE_METAL
+        if (vox_metal_available()) {
+            vox_metal_sgemm_bf16(seq_len, dim, qkv_dim, attn_out,
+                                   l->wo_weight_bf16, proj_out);
+            /* Add wo bias on CPU */
+            for (int s = 0; s < seq_len; s++)
+                for (int j = 0; j < dim; j++)
+                    proj_out[s * dim + j] += l->wo_bias[j];
+        } else {
+#endif
+            vox_linear_bf16(proj_out, attn_out, l->wo_weight_bf16, l->wo_bias, seq_len, qkv_dim, dim);
+#ifdef USE_METAL
+        }
+#endif
         vox_add_inplace(x, proj_out, seq_len * dim);
 
         /* ---- FFN ---- */
@@ -525,7 +538,20 @@ float *vox_encoder_forward_incremental(vox_ctx_t *ctx, const float *x_new,
 #endif
 
         /* Output projection + residual */
-        vox_linear_bf16(proj_out, attn_out, l->wo_weight_bf16, l->wo_bias, new_len, qkv_dim, dim);
+#ifdef USE_METAL
+        if (vox_metal_available()) {
+            vox_metal_sgemm_bf16(new_len, dim, qkv_dim, attn_out,
+                                   l->wo_weight_bf16, proj_out);
+            /* Add wo bias on CPU */
+            for (int s = 0; s < new_len; s++)
+                for (int j = 0; j < dim; j++)
+                    proj_out[s * dim + j] += l->wo_bias[j];
+        } else {
+#endif
+            vox_linear_bf16(proj_out, attn_out, l->wo_weight_bf16, l->wo_bias, new_len, qkv_dim, dim);
+#ifdef USE_METAL
+        }
+#endif
         vox_add_inplace(x, proj_out, new_len * dim);
 
         /* ---- FFN ---- */
