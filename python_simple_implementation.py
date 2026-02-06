@@ -563,18 +563,30 @@ class Decoder:
 
         # Update KV cache
         if layer_idx not in self.kv_cache:
-            self.kv_cache[layer_idx] = (k, v)
+            k_cache = k
+            v_cache = v
         else:
-            old_k, old_v = self.kv_cache[layer_idx]
-            self.kv_cache[layer_idx] = (torch.cat([old_k, k], dim=0),
-                                         torch.cat([old_v, v], dim=0))
+            k_cache, v_cache = self.kv_cache[layer_idx]
+            k_cache = torch.cat([k_cache, k], dim=0)
+            v_cache = torch.cat([v_cache, v], dim=0)
 
+        # Keep only last DEC_WINDOW positions
+        if k_cache.shape[0] > DEC_WINDOW:
+            k_cache = k_cache[-DEC_WINDOW:]
+            v_cache = v_cache[-DEC_WINDOW:]
+
+        self.kv_cache[layer_idx] = (k_cache, v_cache)
         full_k, full_v = self.kv_cache[layer_idx]
 
         # Attention
-        attn_out = causal_attention(q, full_k, full_v,
-                                     DEC_HEADS, DEC_KV_HEADS, DEC_HEAD_DIM,
-                                     DEC_WINDOW, start_pos=pos)
+        kv_start_pos = (pos + seq_len - 1) - (full_k.shape[0] - 1)
+        attn_out = causal_attention(
+            q, full_k, full_v,
+            DEC_HEADS, DEC_KV_HEADS, DEC_HEAD_DIM,
+            DEC_WINDOW,
+            q_start_pos=pos,
+            kv_start_pos=kv_start_pos,
+        )
 
         # Output projection + residual
         attn_proj = F.linear(attn_out, L['wo'])
