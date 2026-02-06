@@ -13,6 +13,9 @@ make mps       # Apple Silicon (fastest)
 make blas      # CPU with BLAS (Accelerate on macOS, OpenBLAS on Linux)
 make clean
 
+# Test (slow — needs fast Apple Silicon GPU, ~2 min on M3/M4 Max)
+make test
+
 # Run (tokens stream to stdout as generated)
 ./voxtral -d voxtral-model -i audio.wav            # default: timing info on stderr
 ./voxtral -d voxtral-model -i audio.wav --silent    # no stderr output

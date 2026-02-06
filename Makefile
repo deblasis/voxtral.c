@@ -18,7 +18,7 @@ TARGET = voxtral
 # Debug build flags
 DEBUG_CFLAGS = -Wall -Wextra -g -O0 -DDEBUG -fsanitize=address
 
-.PHONY: all clean debug info help blas mps inspect
+.PHONY: all clean debug info help blas mps inspect test
 
 # Default: show available targets
 all: help
@@ -35,6 +35,7 @@ endif
 endif
 	@echo ""
 	@echo "Other targets:"
+	@echo "  make test     - Run regression tests (slow, needs fast GPU)"
 	@echo "  make clean    - Remove build artifacts"
 	@echo "  make inspect  - Build safetensors weight inspector"
 	@echo "  make info     - Show build configuration"
@@ -112,6 +113,12 @@ debug: clean $(TARGET)
 inspect: CFLAGS = $(CFLAGS_BASE)
 inspect: inspect_weights.o voxtral_safetensors.o
 	$(CC) $(CFLAGS) -o inspect_weights $^ $(LDFLAGS)
+
+# =============================================================================
+# Test
+# =============================================================================
+test:
+	@./runtest.sh
 
 # =============================================================================
 # Utilities
