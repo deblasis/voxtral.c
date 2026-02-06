@@ -3585,6 +3585,174 @@ void vox_metal_warmup_decoder_ops(void *ctx_ptr) {
                 ctx->ada_scale + (size_t)i * dim, dim * sizeof(float));
     }
     (void)get_cached_weight_buffer(dec->norm, dim * sizeof(float));
+
+    /* Pre-warm encoder MPS matmul ops for typical M values.
+     * Encoder M varies per chunk (50-200). We pre-warm for common ranges
+     * plus prefill M=38 to trigger GPU kernel compilation at load time. */
+    {
+        int edim = VOX_ENC_DIM;
+        int eqkv = (VOX_ENC_HEADS + VOX_ENC_KV_HEADS + VOX_ENC_KV_HEADS) * VOX_ENC_HEAD_DIM;
+        int ewo_k = VOX_ENC_HEADS * VOX_ENC_HEAD_DIM;
+        int ehidden = VOX_ENC_HIDDEN;
+        int effn = ehidden * 2;
+        /* Encoder M values: 64, 128, 200 cover typical chunk sizes */
+        int enc_ms[] = {64, 128, 200};
+        for (int i = 0; i < 3; i++) {
+            int m = enc_ms[i];
+            (void)get_cached_matmul_op(NO, YES, m, eqkv, edim, 1.0, 0.0);
+            (void)get_cached_matmul_op(NO, YES, m, edim, ewo_k, 1.0, 0.0);
+            (void)get_cached_matmul_op(NO, YES, m, effn, edim, 1.0, 0.0);
+            (void)get_cached_matmul_op(NO, YES, m, edim, ehidden, 1.0, 0.0);
+        }
+        /* Prefill M=38 with decoder dimensions */
+        int pM = 38;
+        (void)get_cached_matmul_op(NO, YES, pM, q_dim + kv_dim + kv_dim, dim, 1.0, 0.0);
+        (void)get_cached_matmul_op(NO, YES, pM, dim, q_dim, 1.0, 0.0);
+        (void)get_cached_matmul_op(NO, YES, pM, hidden * 2, dim, 1.0, 0.0);
+        (void)get_cached_matmul_op(NO, YES, pM, dim, hidden, 1.0, 0.0);
+    }
+
+    /* Encode dummy matmuls to trigger GPU pipeline compilation.
+     * Uses layer 0 weights (already cached as f16). */
+    @autoreleasepool {
+        vox_enc_layer_t *el = &ctx->encoder.layers[0];
+        int edim = VOX_ENC_DIM;
+        int eqkv_n = (VOX_ENC_HEADS + VOX_ENC_KV_HEADS + VOX_ENC_KV_HEADS) * VOX_ENC_HEAD_DIM;
+        int ewo_k = VOX_ENC_HEADS * VOX_ENC_HEAD_DIM;
+        int ehidden = VOX_ENC_HIDDEN;
+        int effn_n = ehidden * 2;
+        int M = 128;
+
+        /* Get encoder weight buffers */
+        id<MTLBuffer> wQKV = get_merged_f16_3(
+            el->wq_weight_bf16, (size_t)ewo_k * edim,
+            el->wk_weight_bf16, (size_t)ewo_k * edim,
+            el->wv_weight_bf16, (size_t)ewo_k * edim);
+        id<MTLBuffer> wWo = get_cached_bf16_as_f16_buffer(
+            el->wo_weight_bf16, (size_t)edim * ewo_k);
+        id<MTLBuffer> wFFN = get_merged_f16_2(
+            el->w1_weight_bf16, (size_t)ehidden * edim,
+            el->w3_weight_bf16, (size_t)ehidden * edim);
+        id<MTLBuffer> wW2 = get_cached_bf16_as_f16_buffer(
+            el->w2_weight_bf16, (size_t)edim * ehidden);
+
+        if (wQKV && wWo && wFFN && wW2) {
+            /* Each matmul has different K (input cols): edim, ewo_k, edim, ehidden.
+             * Use max K for shared input buffer, per-op output buffers. */
+            int max_k = ehidden > ewo_k ? ehidden : ewo_k; /* 5120 */
+            int max_n = effn_n > eqkv_n ? effn_n : eqkv_n; /* 10240 */
+            id<MTLBuffer> bufIn  = pool_get_buffer((size_t)M * max_k * sizeof(float));
+            id<MTLBuffer> bufOut = pool_get_buffer((size_t)M * max_n * sizeof(float));
+
+            if (bufIn && bufOut) {
+                id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
+
+                struct { id<MTLBuffer> w; int N, K; } ops[] = {
+                    {wQKV, eqkv_n, edim},
+                    {wWo,  edim, ewo_k},
+                    {wFFN, effn_n, edim},
+                    {wW2,  edim, ehidden},
+                };
+                for (int i = 0; i < 4; i++) {
+                    MPSMatrixDescriptor *dA = [MPSMatrixDescriptor
+                        matrixDescriptorWithRows:M columns:ops[i].K
+                                        rowBytes:ops[i].K * sizeof(float)
+                                        dataType:MPSDataTypeFloat32];
+                    MPSMatrixDescriptor *dW = [MPSMatrixDescriptor
+                        matrixDescriptorWithRows:ops[i].N columns:ops[i].K
+                                        rowBytes:ops[i].K * sizeof(uint16_t)
+                                        dataType:MPSDataTypeFloat16];
+                    MPSMatrixDescriptor *dC = [MPSMatrixDescriptor
+                        matrixDescriptorWithRows:M columns:ops[i].N
+                                        rowBytes:ops[i].N * sizeof(float)
+                                        dataType:MPSDataTypeFloat32];
+                    MPSMatrix *mA = [[MPSMatrix alloc] initWithBuffer:bufIn descriptor:dA];
+                    MPSMatrix *mW = [[MPSMatrix alloc] initWithBuffer:ops[i].w descriptor:dW];
+                    MPSMatrix *mC = [[MPSMatrix alloc] initWithBuffer:bufOut descriptor:dC];
+                    MPSMatrixMultiplication *mm = get_cached_matmul_op(NO, YES, M,
+                        ops[i].N, ops[i].K, 1.0, 0.0);
+                    if (mm) [mm encodeToCommandBuffer:cmd leftMatrix:mA
+                                          rightMatrix:mW resultMatrix:mC];
+                }
+                [cmd commit];
+                [cmd waitUntilCompleted];
+            }
+
+            pool_release_buffer(bufIn);
+            pool_release_buffer(bufOut);
+        }
+
+        /* Also pre-warm with prefill M=38 for decoder dimensions */
+        {
+            vox_dec_layer_t *dl = &dec->layers[0];
+            int pM = 38;
+            int pqkv_n = q_dim + kv_dim + kv_dim;
+            int pffn_n = hidden * 2;
+
+            id<MTLBuffer> dwQKV = get_merged_f16_3(
+                dl->wq_weight_bf16, (size_t)q_dim * dim,
+                dl->wk_weight_bf16, (size_t)kv_dim * dim,
+                dl->wv_weight_bf16, (size_t)kv_dim * dim);
+            id<MTLBuffer> dwWo = get_cached_bf16_as_f16_buffer(
+                dl->wo_weight_bf16, (size_t)dim * q_dim);
+            id<MTLBuffer> dwFFN = get_merged_f16_2(
+                dl->w1_weight_bf16, (size_t)hidden * dim,
+                dl->w3_weight_bf16, (size_t)hidden * dim);
+            id<MTLBuffer> dwW2 = get_cached_bf16_as_f16_buffer(
+                dl->w2_weight_bf16, (size_t)dim * hidden);
+
+            if (dwQKV && dwWo && dwFFN && dwW2) {
+                int pmax_k = hidden > q_dim ? hidden : q_dim; /* 9216 */
+                int pmax_n = pffn_n > pqkv_n ? pffn_n : pqkv_n; /* 18432 */
+                id<MTLBuffer> pIn  = pool_get_buffer((size_t)pM * pmax_k * sizeof(float));
+                id<MTLBuffer> pOut = pool_get_buffer((size_t)pM * pmax_n * sizeof(float));
+
+                if (pIn && pOut) {
+                    id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
+                    struct { id<MTLBuffer> w; int N, K; } pops[] = {
+                        {dwQKV, pqkv_n, dim},
+                        {dwWo,  dim, q_dim},
+                        {dwFFN, pffn_n, dim},
+                        {dwW2,  dim, hidden},
+                    };
+                    for (int i = 0; i < 4; i++) {
+                        MPSMatrixDescriptor *dA = [MPSMatrixDescriptor
+                            matrixDescriptorWithRows:pM columns:pops[i].K
+                                            rowBytes:pops[i].K * sizeof(float)
+                                            dataType:MPSDataTypeFloat32];
+                        MPSMatrixDescriptor *dW = [MPSMatrixDescriptor
+                            matrixDescriptorWithRows:pops[i].N columns:pops[i].K
+                                            rowBytes:pops[i].K * sizeof(uint16_t)
+                                            dataType:MPSDataTypeFloat16];
+                        MPSMatrixDescriptor *dC = [MPSMatrixDescriptor
+                            matrixDescriptorWithRows:pM columns:pops[i].N
+                                            rowBytes:pops[i].N * sizeof(float)
+                                            dataType:MPSDataTypeFloat32];
+                        MPSMatrix *mA = [[MPSMatrix alloc] initWithBuffer:pIn descriptor:dA];
+                        MPSMatrix *mW = [[MPSMatrix alloc] initWithBuffer:pops[i].w descriptor:dW];
+                        MPSMatrix *mC = [[MPSMatrix alloc] initWithBuffer:pOut descriptor:dC];
+                        MPSMatrixMultiplication *mm = get_cached_matmul_op(NO, YES, pM,
+                            pops[i].N, pops[i].K, 1.0, 0.0);
+                        if (mm) [mm encodeToCommandBuffer:cmd leftMatrix:mA
+                                              rightMatrix:mW resultMatrix:mC];
+                    }
+                    [cmd commit];
+                    [cmd waitUntilCompleted];
+                }
+
+                pool_release_buffer(pIn);
+                pool_release_buffer(pOut);
+            }
+        }
+    }
+
+    /* Pre-warm encoder f32 weight buffers (norms, biases) */
+    for (int i = 0; i < VOX_ENC_LAYERS; i++) {
+        vox_enc_layer_t *l = &ctx->encoder.layers[i];
+        (void)get_cached_weight_buffer(l->attention_norm, VOX_ENC_DIM * sizeof(float));
+        (void)get_cached_weight_buffer(l->ffn_norm, VOX_ENC_DIM * sizeof(float));
+    }
+    (void)get_cached_weight_buffer(ctx->encoder.norm, VOX_ENC_DIM * sizeof(float));
 }
 
 size_t vox_metal_memory_used(void) {
