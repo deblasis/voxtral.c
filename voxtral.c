@@ -985,8 +985,6 @@ vox_stream_t *vox_stream_init(vox_ctx_t *ctx) {
     /* Default processing interval: 2 seconds (200 mel frames) */
     s->min_new_mel = (int)(STREAM_DEFAULT_INTERVAL * 100.0f);
 
-    /* Initialize adapter buffer fields */
-    s->adapter_len = 0;
     s->adapter_pos_offset = 0;
 
     return s;
