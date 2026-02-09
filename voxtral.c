@@ -408,10 +408,9 @@ struct vox_stream {
 
     /* Adapter output buffer (growing) */
     float *adapter_buf;
-    int total_adapter;       /* Total tokens generated (logical) */
-    int adapter_len;         /* Physical tokens in buffer */
-    int adapter_cap;         /* Allocated capacity */
-    int adapter_pos_offset;  /* Logical offset from compactions */
+    int total_adapter;      /* total logical tokens produced */
+    int adapter_cap;
+    int adapter_pos_offset; /* logical offset from compactions */
 
     /* Decoder state */
     int decoder_started;
@@ -666,22 +665,20 @@ static float *stream_conv_stem(vox_stream_t *s, const float *mel_new,
     return result;
 }
 
-/* Compact adapter buffer: discard old tokens, keep sliding window */
+/* Compact adapter buffer: discard tokens the decoder has already consumed */
 static void stream_adapter_compact(vox_stream_t *s) {
+    int consumed = s->gen_pos - s->adapter_pos_offset;
+    if (consumed <= 0) return;
+
     int dim = VOX_DEC_DIM;
-    int keep = VOX_ADA_WINDOW;
+    int remaining = (s->total_adapter - s->adapter_pos_offset) - consumed;
 
-    if (s->adapter_len <= keep) return;
+    if (remaining > 0)
+        memmove(s->adapter_buf,
+                s->adapter_buf + (size_t)consumed * dim,
+                (size_t)remaining * dim * sizeof(float));
 
-    int discard = s->adapter_len - keep;
-    size_t keep_bytes = (size_t)keep * dim * sizeof(float);
-
-    memmove(s->adapter_buf,
-            s->adapter_buf + (size_t)discard * dim,
-            keep_bytes);
-
-    s->adapter_pos_offset += discard;
-    s->adapter_len = keep;
+    s->adapter_pos_offset += consumed;
 }
 
 /* Run encoder incrementally on available mel, append adapter tokens */
@@ -751,22 +748,19 @@ static void stream_run_encoder(vox_stream_t *s) {
         free(combined);
 
         if (adapter_chunk && chunk_tokens > 0) {
-            /* Compact adapter buffer if needed before appending */
-            stream_adapter_compact(s);
-
-            /* Append to adapter buffer */
-            if (s->adapter_len + chunk_tokens > s->adapter_cap) {
+            /* Append to adapter buffer (physical offsets account for compaction) */
+            int phys_len = s->total_adapter - s->adapter_pos_offset;
+            if (phys_len + chunk_tokens > s->adapter_cap) {
                 int new_cap = s->adapter_cap ? s->adapter_cap * 2 : 256;
-                while (new_cap < s->adapter_len + chunk_tokens) new_cap *= 2;
+                while (new_cap < phys_len + chunk_tokens) new_cap *= 2;
                 float *tmp = (float *)realloc(s->adapter_buf,
                     (size_t)new_cap * dim * sizeof(float));
                 if (!tmp) { free(adapter_chunk); free(enc_out); return; }
                 s->adapter_buf = tmp;
                 s->adapter_cap = new_cap;
             }
-            memcpy(s->adapter_buf + (size_t)s->adapter_len * dim,
+            memcpy(s->adapter_buf + (size_t)phys_len * dim,
                    adapter_chunk, (size_t)chunk_tokens * dim * sizeof(float));
-            s->adapter_len += chunk_tokens;
             s->total_adapter += chunk_tokens;
             free(adapter_chunk);
         } else {
@@ -920,8 +914,8 @@ static void stream_run_decoder(vox_stream_t *s) {
         int gen_before = s->n_generated;
         while (s->gen_pos < s->total_adapter) {
             tok_embed_bf16_to_f32(s->tok_tmp, tok_emb_bf16, s->prev_token, dim);
-            int physical_pos = s->gen_pos - s->adapter_pos_offset;
-            const float *a = s->adapter_buf + (size_t)physical_pos * dim;
+            int phys_pos = s->gen_pos - s->adapter_pos_offset;
+            const float *a = s->adapter_buf + (size_t)phys_pos * dim;
             for (int j = 0; j < dim; j++)
                 s->step_embed[j] = a[j] + s->tok_tmp[j];
 
@@ -943,6 +937,9 @@ static void stream_run_decoder(vox_stream_t *s) {
                              (t1.tv_usec - t0.tv_usec) / 1000.0;
         }
     }
+
+    /* Reclaim adapter buffer space for tokens the decoder has consumed */
+    stream_adapter_compact(s);
 }
 
 vox_stream_t *vox_stream_init(vox_ctx_t *ctx) {
@@ -1008,34 +1005,18 @@ int vox_stream_feed(vox_stream_t *s, const float *samples, int n_samples) {
 
 int vox_stream_finish(vox_stream_t *s) {
     if (!s || s->finished) return -1;
+
+    /* Flush with right padding (shared with vox_stream_flush) */
+    vox_stream_flush(s);
+
     s->finished = 1;
-
-    int n_delay_tokens = s->ctx->delay_tokens;
-
-    /* Right padding: align + buffer tokens */
-    int align_pad = (RAW_AUDIO_LENGTH_PER_TOK -
-        (s->real_samples_fed % RAW_AUDIO_LENGTH_PER_TOK)) % RAW_AUDIO_LENGTH_PER_TOK;
-    int n_right_pad_tokens = (n_delay_tokens + 1) + OFFLINE_STREAMING_BUFFER_TOKENS;
-    int right_pad = align_pad + n_right_pad_tokens * RAW_AUDIO_LENGTH_PER_TOK;
-
-    /* Feed right padding zeros */
-    float zero_buf[4096];
-    memset(zero_buf, 0, sizeof(zero_buf));
-    int remaining = right_pad;
-    while (remaining > 0) {
-        int chunk = remaining > 4096 ? 4096 : remaining;
-        vox_mel_feed(s->mel_ctx, zero_buf, chunk);
-        remaining -= chunk;
-    }
-
-    /* Finalize mel */
     vox_mel_finish(s->mel_ctx, 0);
 
     if (vox_verbose >= 2)
         fprintf(stderr, "Stream finished: %d real samples (%.1f sec)\n",
                 s->real_samples_fed, (float)s->real_samples_fed / VOX_SAMPLE_RATE);
 
-    /* Process remaining encoder chunks and generate remaining tokens */
+    /* Final pass after mel finalization */
     stream_run_encoder(s);
     stream_run_decoder(s);
     return 0;
@@ -1360,6 +1341,35 @@ char *vox_transcribe(vox_ctx_t *ctx, const char *wav_path) {
     char *text = vox_transcribe_audio(ctx, samples, n_samples);
     free(samples);
     return text;
+}
+
+int vox_stream_flush(vox_stream_t *s) {
+    if (!s || s->finished) return -1;
+
+    /* Feed the same right padding that finish() uses, so the decoder can
+     * push out tokens that are behind the delay window. */
+    int n_delay_tokens = s->ctx->delay_tokens;
+    int align_pad = (RAW_AUDIO_LENGTH_PER_TOK -
+        (s->real_samples_fed % RAW_AUDIO_LENGTH_PER_TOK)) % RAW_AUDIO_LENGTH_PER_TOK;
+    int n_right_pad_tokens = (n_delay_tokens + 1) + OFFLINE_STREAMING_BUFFER_TOKENS;
+    int right_pad = align_pad + n_right_pad_tokens * RAW_AUDIO_LENGTH_PER_TOK;
+
+    float zero_buf[4096];
+    memset(zero_buf, 0, sizeof(zero_buf));
+    int remaining = right_pad;
+    while (remaining > 0) {
+        int chunk = remaining > 4096 ? 4096 : remaining;
+        vox_mel_feed(s->mel_ctx, zero_buf, chunk);
+        remaining -= chunk;
+    }
+
+    /* Force encoder to process all buffered mel, then run decoder */
+    int saved = s->min_new_mel;
+    s->min_new_mel = 1;
+    stream_run_encoder(s);
+    stream_run_decoder(s);
+    s->min_new_mel = saved;
+    return 0;
 }
 
 void vox_set_processing_interval(vox_stream_t *s, float seconds) {
